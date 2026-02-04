@@ -276,6 +276,160 @@ namespace McpUnity.Tools
             }
             return null;
         }
+
+        /// <summary>
+        /// Checks if a JToken represents an object reference syntax ($component, $asset, etc.)
+        /// </summary>
+        /// <param name="token">The JToken to check</param>
+        /// <returns>True if the token uses reference syntax</returns>
+        private bool IsObjectReferenceSyntax(JToken token)
+        {
+            if (token is not JObject obj) return false;
+            
+            return obj.ContainsKey("$component") ||
+                   obj.ContainsKey("$asset") ||
+                   obj.ContainsKey("$guid") ||
+                   obj.ContainsKey("$instanceId") ||
+                   obj.ContainsKey("$self");
+        }
+
+        /// <summary>
+        /// Resolves a reference syntax JObject to an actual Unity object
+        /// </summary>
+        /// <param name="refObj">The JObject containing reference syntax</param>
+        /// <param name="contextGameObject">The GameObject context for relative references</param>
+        /// <param name="contextComponent">The component being modified (for $self)</param>
+        /// <returns>The resolved Unity object, or null if resolution fails</returns>
+        private UnityEngine.Object ResolveObjectReference(
+            JObject refObj, 
+            GameObject contextGameObject,
+            Component contextComponent)
+        {
+            // $self - return the component being modified
+            if (refObj.TryGetValue("$self", out _))
+            {
+                return contextComponent;
+            }
+            
+            // $instanceId (standalone) - direct instance ID lookup
+            if (refObj.TryGetValue("$instanceId", out var instanceIdToken) && !refObj.ContainsKey("$component"))
+            {
+                int instanceId = instanceIdToken.Value<int>();
+                var obj = EditorUtility.InstanceIDToObject(instanceId);
+                if (obj == null)
+                {
+                    McpLogger.LogWarning($"[MCP Unity] Could not find object with instance ID: {instanceId}");
+                }
+                return obj;
+            }
+            
+            // $asset - load asset by path
+            if (refObj.TryGetValue("$asset", out var assetPathToken))
+            {
+                string assetPath = assetPathToken.ToString();
+                var asset = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(assetPath);
+                if (asset == null)
+                {
+                    McpLogger.LogWarning($"[MCP Unity] Could not load asset at path: {assetPath}");
+                }
+                return asset;
+            }
+            
+            // $guid - load asset by GUID
+            if (refObj.TryGetValue("$guid", out var guidToken))
+            {
+                string guid = guidToken.ToString();
+                string assetPath = AssetDatabase.GUIDToAssetPath(guid);
+                if (string.IsNullOrEmpty(assetPath))
+                {
+                    McpLogger.LogWarning($"[MCP Unity] Could not find asset with GUID: {guid}");
+                    return null;
+                }
+                return AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(assetPath);
+            }
+            
+            // $component - find component on GameObject
+            if (refObj.TryGetValue("$component", out var componentNameToken))
+            {
+                string componentTypeName = componentNameToken.ToString();
+                GameObject targetGO = contextGameObject;
+                
+                // Check if targeting a different GameObject by path
+                if (refObj.TryGetValue("$gameObject", out var goPathToken))
+                {
+                    string goPath = goPathToken.ToString();
+                    targetGO = GameObject.Find(goPath);
+                    if (targetGO == null)
+                    {
+                        // Try as child of context
+                        Transform child = contextGameObject.transform.Find(goPath);
+                        targetGO = child?.gameObject;
+                    }
+                    if (targetGO == null)
+                    {
+                        // Try using our path finding method
+                        targetGO = FindGameObjectByPath(goPath);
+                    }
+                    if (targetGO == null)
+                    {
+                        McpLogger.LogWarning($"[MCP Unity] Could not find GameObject: {goPath}");
+                        return null;
+                    }
+                }
+                // Check if targeting a different GameObject by instance ID
+                else if (refObj.TryGetValue("$instanceId", out var goInstanceIdToken))
+                {
+                    int goInstanceId = goInstanceIdToken.Value<int>();
+                    var obj = EditorUtility.InstanceIDToObject(goInstanceId);
+                    if (obj is GameObject go)
+                    {
+                        targetGO = go;
+                    }
+                    else if (obj is Component comp)
+                    {
+                        targetGO = comp.gameObject;
+                    }
+                    else
+                    {
+                        McpLogger.LogWarning($"[MCP Unity] Instance ID {goInstanceId} is not a GameObject or Component");
+                        return null;
+                    }
+                }
+                
+                // Find the component type
+                Type componentType = FindComponentType(componentTypeName);
+                if (componentType == null)
+                {
+                    McpLogger.LogWarning($"[MCP Unity] Could not find component type: {componentTypeName}");
+                    return null;
+                }
+                
+                // Check for index (when multiple components of same type exist)
+                int index = 0;
+                if (refObj.TryGetValue("$index", out var indexToken))
+                {
+                    index = indexToken.Value<int>();
+                }
+                
+                var components = targetGO.GetComponents(componentType);
+                if (components.Length == 0)
+                {
+                    McpLogger.LogWarning($"[MCP Unity] No {componentTypeName} component found on GameObject '{targetGO.name}'");
+                    return null;
+                }
+                if (index >= components.Length)
+                {
+                    McpLogger.LogWarning($"[MCP Unity] Component index {index} out of range. " +
+                                       $"GameObject '{targetGO.name}' has {components.Length} {componentTypeName} component(s)");
+                    return null;
+                }
+                
+                return components[index];
+            }
+            
+            McpLogger.LogWarning($"[MCP Unity] Unknown reference syntax: {refObj}");
+            return null;
+        }
         
         /// <summary>
         /// Update component data based on the provided JObject
@@ -323,7 +477,7 @@ namespace McpUnity.Tools
                 
                 if (serializedProperty != null)
                 {
-                    SetSerializedPropertyValue(serializedProperty, fieldValue);
+                    SetSerializedPropertyValue(serializedProperty, fieldValue, component.gameObject, component);
                     continue;
                 }
                 
@@ -397,7 +551,7 @@ namespace McpUnity.Tools
                     continue;
                 }
                 
-                SetSerializedPropertyValue(serializedProperty, fieldValue);
+                SetSerializedPropertyValue(serializedProperty, fieldValue, component.gameObject, component);
             }
             
             serializedObject.ApplyModifiedProperties();
@@ -409,8 +563,43 @@ namespace McpUnity.Tools
         /// </summary>
         /// <param name="prop">The SerializedProperty to set</param>
         /// <param name="value">The JToken value to apply</param>
-        private void SetSerializedPropertyValue(SerializedProperty prop, JToken value)
+        /// <param name="contextGameObject">The GameObject context for reference resolution</param>
+        /// <param name="contextComponent">The component being modified (for $self reference)</param>
+        private void SetSerializedPropertyValue(
+            SerializedProperty prop, 
+            JToken value,
+            GameObject contextGameObject,
+            Component contextComponent)
         {
+            // Check for object reference syntax first ($component, $asset, $guid, etc.)
+            if (IsObjectReferenceSyntax(value))
+            {
+                if (prop.propertyType == SerializedPropertyType.ObjectReference)
+                {
+                    var resolved = ResolveObjectReference((JObject)value, contextGameObject, contextComponent);
+                    prop.objectReferenceValue = resolved;
+                    return;
+                }
+                else
+                {
+                    McpLogger.LogWarning($"[MCP Unity] Reference syntax used but property '{prop.propertyPath}' " +
+                                       $"is not an ObjectReference (type: {prop.propertyType})");
+                    return;
+                }
+            }
+            
+            // Handle JArray for array properties
+            if (value is JArray jArr)
+            {
+                prop.arraySize = jArr.Count;
+                for (int i = 0; i < jArr.Count; i++)
+                {
+                    var element = prop.GetArrayElementAtIndex(i);
+                    SetSerializedPropertyValue(element, jArr[i], contextGameObject, contextComponent);
+                }
+                return;
+            }
+            
             switch (prop.propertyType)
             {
                 case SerializedPropertyType.Integer:
@@ -681,7 +870,7 @@ namespace McpUnity.Tools
                             SerializedProperty childProp = prop.FindPropertyRelative(child.Name);
                             if (childProp != null)
                             {
-                                SetSerializedPropertyValue(childProp, child.Value);
+                                SetSerializedPropertyValue(childProp, child.Value, contextGameObject, contextComponent);
                             }
                         }
                     }
